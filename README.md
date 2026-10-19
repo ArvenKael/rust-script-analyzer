@@ -1,2 +1,2 @@
 # rust-analyzer-script
-A small wrapper around rust-analyzer for standalone rust script files
+A small wrapper around rust-analyzer for standalone rust script files in rust-script format.
