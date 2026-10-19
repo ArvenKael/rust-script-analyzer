@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""
+LSP proxy in front of rust-analyzer that understands rust-script files.
+
+Helix launches this instead of rust-analyzer. For every opened/saved .rs file
+that is a rust-script (shebang mentions rust-script, or a ```cargo block sits
+in its leading comments) it runs `rust-script --package <file>` to materialise
+the Cargo manifest for the script's dependencies, then adds that manifest to
+rust-analyzer's `linkedProjects`.
+"""
+import json
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import argparse
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+HOME = Path.home()
+RUST_SCRIPT = shutil.which("rust-script") or str(HOME / ".cargo/bin/rust-script")
+RUST_ANALYZER = shutil.which("rust-analyzer") or str(HOME / ".cargo/bin/rust-analyzer")
+LOG_PATH = HOME / ".cache/rust-script-analyzer.log"
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+LOG = open(LOG_PATH, "a", buffering=1)
+
+FENCE_RE = re.compile(r"^\s*(//[/!]?|#)?\s*```\s*cargo\b")
+
+
+def log(*args):
+    print(*args, file=LOG)
+
+
+class State:
+    def __init__(self):
+        self.write_lock = threading.Lock()
+        self.root_manifests = []        # workspace Cargo.toml, if any
+        self.script_manifests = {}      # script path -> generated Cargo.toml
+        self.config_request_ids = set() # RA workspace/configuration request ids
+        self.linked_sent = None         # last linkedProjects value pushed to RA
+
+
+state = State()
+
+
+# ---------------------------------------------------------------- LSP framing
+
+def read_message(stream):
+    headers = {}
+    while True:
+        line = stream.readline()
+        if not line:
+            return None
+        line = line.decode("ascii", "replace").strip()
+        if not line:
+            break
+        key, _, value = line.partition(":")
+        headers[key.lower()] = value.strip()
+    body = stream.read(int(headers["content-length"]))
+    return json.loads(body)
+
+
+def write_message(stream, msg):
+    data = json.dumps(msg).encode("utf-8")
+    with state.write_lock:
+        stream.write(b"Content-Length: %d\r\n\r\n" % len(data) + data)
+        stream.flush()
+
+
+# ------------------------------------------------------------ script handling
+
+def is_rust_script(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            head = [line for _, line in zip(range(200), f)]
+    except OSError:
+        return False
+    if head and head[0].startswith("#!") and "rust-script" in head[0]:
+        return True
+    return any(FENCE_RE.match(line) for line in head)
+
+
+def generate_manifest(path):
+    """Run `rust-script --package` and return the path of the generated Cargo.toml."""
+    try:
+        proc = subprocess.run(
+            [RUST_SCRIPT, "--package", path],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log("rust-script failed for", path, e)
+        return None
+    if proc.returncode != 0:
+        log("rust-script error for", path, proc.stderr.strip())
+        return None
+    lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+    if not lines:
+        return None
+    manifest = Path(lines[-1]) / "Cargo.toml"
+    return str(manifest) if manifest.exists() else None
+
+
+def find_root_manifest(root_uri):
+    if not root_uri:
+        return []
+    root = Path(unquote(urlparse(root_uri).path))
+    for d in [root, *root.parents]:
+        if (d / "Cargo.toml").exists():
+            return [str(d / "Cargo.toml")]
+    return []
+
+
+def linked_projects():
+    return state.root_manifests + sorted(set(state.script_manifests.values()))
+
+
+def refresh_script(uri, server_in):
+    path = unquote(urlparse(uri).path)
+    if not path.endswith(".rs") or not is_rust_script(path):
+        return
+    manifest = generate_manifest(path)
+    if manifest is None:
+        return
+    state.script_manifests[path] = manifest
+    projects = linked_projects()
+    if state.linked_sent != projects:
+        log("linkedProjects ->", projects)
+        state.linked_sent = projects
+        # Makes RA re-request configuration, which we answer with linkedProjects.
+        write_message(server_in, {
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeConfiguration",
+            "params": {"settings": None},
+        })
+
+
+def inject_linked_projects(result):
+    projects = linked_projects()
+    if not projects:
+        return result
+    # Config may come back as a list (one entry per requested section) or a bare object.
+    items = result if isinstance(result, list) else [result]
+    out = []
+    for item in items:
+        # Helix answers null for sections without user config; that is the common case.
+        item = dict(item) if isinstance(item, dict) else {}
+        item["linkedProjects"] = projects
+        out.append(item)
+    return out if isinstance(result, list) else out[0]
+
+
+# ------------------------------------------------------------------- pumps
+
+def add_dependency(args):
+    """Add a dependency to a rust-script `// ! ```cargo` block."""
+    if len(args) < 2:
+        print("Usage: rust-script-analyzer add [SCRIPT.rs] DEPENDENCY [VERSION]", file=sys.stderr)
+        return 2
+
+    # Accept both `add script.rs serde` and cargo-add-like `add serde`.
+    if args[0].endswith(".rs"):
+        script, dependency, *rest = args
+    else:
+        dependency, *rest = args
+        candidates = [p for p in Path.cwd().glob("*.rs") if is_rust_script(str(p))]
+        if len(candidates) != 1:
+            print("Specify SCRIPT.rs (or run in a directory with exactly one rust-script .rs file).", file=sys.stderr)
+            return 2
+        script = str(candidates[0])
+    version = rest[0] if rest else "*"
+    if len(rest) > 1:
+        print("Usage: rust-script-analyzer add [SCRIPT.rs] DEPENDENCY [VERSION]", file=sys.stderr)
+        return 2
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", dependency):
+        print("Dependency must be a crate name (letters, digits, _ or -).", file=sys.stderr)
+        return 2
+
+    path = Path(script).expanduser().resolve()
+    if not path.is_file() or not is_rust_script(str(path)):
+        print(f"Not a rust-script file: {path}", file=sys.stderr)
+        return 2
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    opening = next((i for i, line in enumerate(lines) if FENCE_RE.match(line)), None)
+    if opening is None:
+        print("No ```cargo block found. Add a rust-script cargo block first.", file=sys.stderr)
+        return 2
+    prefix = re.match(r"^\s*(//[/!]?|#)?\s*", lines[opening]).group(0)
+    closing = next((i for i in range(opening + 1, len(lines))
+                    if re.match(r"^\s*(//[/!]?|#)?\s*```\s*$", lines[i])), None)
+    if closing is None:
+        print("Unclosed ```cargo block.", file=sys.stderr)
+        return 2
+
+    # Strip the Rust doc-comment prefix to inspect cargo TOML lines.
+    body = []
+    for i in range(opening + 1, closing):
+        line = lines[i]
+        body.append(re.sub(r"^\s*//[/!]? ?", "", line, count=1))
+    dep_re = re.compile(r"^\s*" + re.escape(dependency) + r"\s*=")
+    if any(dep_re.match(line) for line in body):
+        print(f"{dependency} is already listed in {path}")
+        return 0
+
+    dep_line = f'{dependency} = "{version}"\n'
+    deps_header = next((i for i, line in enumerate(body)
+                        if re.match(r"^\s*\[dependencies\]\s*(?:#.*)?$", line)), None)
+    if deps_header is None:
+        insert = f"{prefix}[dependencies]\n{prefix}{dep_line}"
+        lines[closing:closing] = [insert]
+    else:
+        insert_at = deps_header + 1
+        while insert_at < len(body) and not re.match(r"^\s*\[", body[insert_at]):
+            insert_at += 1
+        lines.insert(opening + 1 + insert_at, f"{prefix}{dep_line}")
+
+    path.write_text("".join(lines), encoding="utf-8")
+    print(f"Added {dependency} = \"{version}\" to {path}")
+    return 0
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "add":
+        raise SystemExit(add_dependency(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] in ("--help", "-h"):
+        print("Usage: rust-script-analyzer [add [SCRIPT.rs] DEPENDENCY [VERSION]]\n"
+              "       With no command, runs the Helix rust-analyzer LSP proxy.")
+        return
+
+    server = subprocess.Popen(
+        [RUST_ANALYZER, *sys.argv[1:]],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    )
+    client_in = sys.stdin.buffer
+    client_out = sys.stdout.buffer
+    server_in = server.stdin
+    server_out = server.stdout
+
+    def server_loop():
+        """rust-analyzer -> Helix."""
+        while True:
+            msg = read_message(server_out)
+            if msg is None:
+                break
+            if msg.get("method") == "workspace/configuration" and "id" in msg:
+                log("RA config request", json.dumps(msg.get("params")))
+                state.config_request_ids.add(json.dumps(msg["id"]))
+            write_message(client_out, msg)
+        try:
+            client_out.close()
+        except OSError:
+            pass
+
+    threading.Thread(target=server_loop, daemon=True).start()
+
+    while True:
+        msg = read_message(client_in)
+        if msg is None:
+            break
+        method = msg.get("method")
+        params = msg.get("params") or {}
+
+        # Helix's reply to a rust-analyzer workspace/configuration request.
+        if method is None and "id" in msg:
+            key = json.dumps(msg["id"])
+            if key in state.config_request_ids:
+                state.config_request_ids.discard(key)
+                log("Helix config reply", json.dumps(msg.get("result")))
+                msg["result"] = inject_linked_projects(msg.get("result"))
+            write_message(server_in, msg)
+            continue
+
+        if method == "initialize":
+            folders = params.get("workspaceFolders") or [{}]
+            state.root_manifests = find_root_manifest(
+                params.get("rootUri") or folders[0].get("uri")
+            )
+
+        write_message(server_in, msg)
+
+        if method in ("textDocument/didOpen", "textDocument/didSave"):
+            refresh_script(params["textDocument"]["uri"], server_in)
+
+        if method == "exit":
+            break
+
+    try:
+        server_in.close()
+    except OSError:
+        pass
+    try:
+        server.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        server.kill()
+
+
+if __name__ == "__main__":
+    main()
